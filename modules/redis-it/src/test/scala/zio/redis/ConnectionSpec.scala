@@ -129,12 +129,12 @@ trait ConnectionSpec extends IntegrationSpec {
           ZLayer.succeed(ProtobufCodecSupplier)
         ) @@ TestAspect.withLiveClock @@ TestAspect.timeout(90.seconds),
         test("re-authenticate after connection dies under load") {
-          // This test reproduces the re-authentication race condition:
+          // This test guards against the re-authentication race condition:
           // 1. Multiple concurrent requests are running continuously
           // 2. Server dies (simulated by kill)
-          // 3. During connection.reconnect in onError, new requests get enqueued
-          // 4. AUTH is enqueued AFTER these requests
-          // 5. Requests sent before AUTH fail with NOAUTH
+          // 3. The connection reconnects while new requests are still arriving
+          // 4. AUTH must complete before normal commands resume
+          // 5. Requests after reconnect must not fail with NOAUTH
           //
           // This simulates what happens when you have active traffic and
           // the connection drops (e.g., due to idle timeout, network issues, etc.)
@@ -184,13 +184,67 @@ trait ConnectionSpec extends IntegrationSpec {
             }
             println(s"NOAUTH errors: ${noauthErrors.size}")
             println(s"Final ping: $finalResult")
-            // The bug: NOAUTH errors occur because commands race with AUTH
             assertTrue(noauthErrors.isEmpty) &&
             assertTrue(finalResult.isRight)
           }
         }.provideSome[DockerComposeContainer](
           Redis.singleNode,
           singleNodeConfig(IntegrationSpec.SingleNode2, Some("asdf")),
+          ZLayer.succeed(ProtobufCodecSupplier)
+        ) @@ TestAspect.withLiveClock @@ TestAspect.timeout(90.seconds),
+        test("re-select database after connection dies under load") {
+          for {
+            docker      <- ZIO.service[DockerComposeContainer]
+            redis       <- ZIO.service[Redis]
+            _           <- redis.set("db-selection-test", "db-1-before")
+            containerId  = docker.getContainerByServiceName(IntegrationSpec.SingleNode2).get.getContainerId()
+            dockerClient = DockerClientFactory.instance().client()
+            errorsRef   <- Ref.make(List.empty[Throwable])
+            successRef  <- Ref.make(0)
+            loops       <- ZIO.foreach(1 to 5) { i =>
+                             (redis
+                               .set(s"db-selection-loop-$i", "db-1-value")
+                               .either
+                               .flatMap {
+                                 case Right(_) => successRef.update(_ + 1)
+                                 case Left(e)  => errorsRef.update(e :: _)
+                               }
+                               .forever)
+                               .fork
+                           }
+            _           <- ZIO.sleep(100.millis)
+            _           <- ZIO.attempt(dockerClient.killContainerCmd(containerId).exec()).orDie
+            _           <- ZIO.sleep(1.second)
+            _           <- ZIO.attempt(dockerClient.startContainerCmd(containerId).exec()).orDie
+            _           <- ZIO.sleep(3.seconds)
+            _           <- ZIO.foreach(loops)(_.interrupt)
+            _           <- redis.set("db-selection-test", "db-1-after")
+            dbOneValue  <- redis.get("db-selection-test").returning[String]
+            _           <- redis.select(0)
+            dbZeroValue <- redis.get("db-selection-test").returning[String]
+            errors      <- errorsRef.get
+            successes   <- successRef.get
+            noauthErrors = errors.collect {
+                             case e: ProtocolError if e.message.contains("NOAUTH")                  => e
+                             case e: ProtocolError if e.message.contains("Authentication required") => e
+                           }
+          } yield {
+            println(s"=== Re-select Database Under Load Test ===")
+            println(s"Successes: $successes")
+            println(s"Total errors: ${errors.size}")
+            errors.groupBy(_.getClass.getSimpleName).toList.take(5).foreach { case (k, v) =>
+              println(s"  $k: ${v.size}")
+            }
+            println(s"NOAUTH errors: ${noauthErrors.size}")
+            println(s"DB 1 value: $dbOneValue")
+            println(s"DB 0 value: $dbZeroValue")
+            assertTrue(noauthErrors.isEmpty) &&
+            assertTrue(dbOneValue.contains("db-1-after")) &&
+            assertTrue(dbZeroValue.isEmpty)
+          }
+        }.provideSome[DockerComposeContainer](
+          Redis.singleNode,
+          singleNodeConfig(IntegrationSpec.SingleNode2, Some("asdf"), Some(1)),
           ZLayer.succeed(ProtobufCodecSupplier)
         ) @@ TestAspect.withLiveClock @@ TestAspect.timeout(90.seconds)
       ) @@ clusterExecutorUnsupported

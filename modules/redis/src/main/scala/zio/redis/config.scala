@@ -25,7 +25,8 @@ final case class RedisConfig(
   ssl: Boolean = false,
   verifyCertificate: Boolean = true,
   requestQueueSize: Int = RedisConfig.DefaultRequestQueueSize,
-  auth: Option[RedisConfig.Auth] = None
+  auth: Option[RedisConfig.Auth] = None,
+  database: Option[Long] = None
 )
 
 object RedisConfig {

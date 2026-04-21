@@ -40,13 +40,14 @@ trait IntegrationSpec extends ZIOSpecDefault {
 
   final def singleNodeConfig(
     host: String,
-    password: Option[String] = None
+    password: Option[String] = None,
+    database: Option[Long] = None
   ): URLayer[DockerComposeContainer, RedisConfig] =
     ZLayer {
       for {
         docker      <- ZIO.service[DockerComposeContainer]
         hostAndPort <- docker.getHostAndPort(host)(6379)
-      } yield RedisConfig(hostAndPort._1, hostAndPort._2, auth = password.map(RedisConfig.Auth(_)))
+      } yield RedisConfig(hostAndPort._1, hostAndPort._2, auth = password.map(RedisConfig.Auth(_)), database = database)
     }
 
   /* TODO

@@ -17,7 +17,7 @@
 package zio.redis.internal
 
 import zio._
-import zio.redis.Input.AuthInput
+import zio.redis.Input.{AuthInput, LongInput}
 import zio.redis.Output.UnitOutput
 import zio.redis.internal.SingleNodeExecutor._
 import zio.redis.{RedisConfig, RedisError}
@@ -35,33 +35,33 @@ private[redis] final class SingleNodeExecutor private (
   def execute(command: RespCommand): UIO[IO[RedisError, RespValue]] =
     // Acquire the reconnect lock to ensure we don't enqueue while reconnecting
     reconnectLock.withPermit {
-      Promise
-        .make[RedisError, RespValue]
-        .flatMap(promise => requests.offer(Request(command.args.map(_.value), promise)).as(promise.await))
+      executeDirect(command)
     }
 
-  val auth: ZIO[Any, Nothing, Unit] = ZIO.foreachDiscard(config.auth) { auth =>
+  val auth: UIO[Unit] = ZIO.foreachDiscard(config.auth) { auth =>
     val cmd = RedisCommand("AUTH", AuthInput, UnitOutput).resp(zio.redis.Auth(auth.username, auth.password))
-    // Auth bypasses the lock since it's called during reconnection
-    Promise
-      .make[RedisError, RespValue]
-      .flatMap(promise => requests.offer(Request(cmd.args.map(_.value), promise)).as(promise.await))
-      .unit
+    enqueueDirect(command = cmd)
   }
 
+  val selectDatabase: UIO[Unit] = ZIO.foreachDiscard(config.database) { database =>
+    val cmd = RedisCommand("SELECT", LongInput, UnitOutput).resp(database)
+    enqueueDirect(command = cmd)
+  }
+
+  val initializeConnection: UIO[Unit] =
+    auth *> selectDatabase
+
   def onError(e: RedisError): UIO[Unit] =
-    // Fail all pending responses (commands that were sent but not yet responded)
-    responses.takeAll.flatMap(ZIO.foreachDiscard(_)(_.fail(e))) *>
-      // Acquire lock to prevent new requests during reconnection
-      reconnectLock.withPermit {
+    // Acquire lock to prevent new requests during reconnection
+    reconnectLock.withPermit {
+      // Fail all pending responses (commands that were sent but not yet responded)
+      responses.takeAll.flatMap(ZIO.foreachDiscard(_)(_.fail(e))) *>
         // Clear any pending requests
         requests.takeAll.flatMap(ZIO.foreachDiscard(_)(_.promise.fail(e))) *>
-          connection.reconnect *>
-          // AUTH is enqueued here, before releasing the lock
-          auth
-      }.catchAll { e =>
-        ZIO.logError(s"Unable to reconnect to redis server: ${e}")
-      }
+        reconnectAndInitialize
+    }.catchAll { e =>
+      ZIO.logError(s"Unable to reconnect to redis server: ${e}")
+    }
 
   def send: IO[RedisError.IOError, Unit] =
     requests.takeBetween(1, requestQueueSize).flatMap { requests =>
@@ -87,6 +87,20 @@ private[redis] final class SingleNodeExecutor private (
       .collectSome
       .foreach(response => responses.take.flatMap(_.succeed(response)))
 
+  private def executeDirect(command: RespCommand): UIO[IO[RedisError, RespValue]] =
+    Promise
+      .make[RedisError, RespValue]
+      .flatMap(promise => requests.offer(Request(command.args.map(_.value), promise)).as(promise.await))
+
+  private def enqueueDirect(command: RespCommand): UIO[Unit] =
+    Promise
+      .make[RedisError, RespValue]
+      .flatMap(promise => requests.offer(Request(command.args.map(_.value), promise)))
+      .unit
+
+  private def reconnectAndInitialize: IO[RedisError.IOError, Unit] =
+    connection.reconnect.mapError(RedisError.IOError(_)) *> initializeConnection
+
 }
 
 private[redis] object SingleNodeExecutor {
@@ -106,7 +120,7 @@ private[redis] object SingleNodeExecutor {
       reconnectLock   <- Semaphore.make(1)
       executor         = new SingleNodeExecutor(config, connection, requests, responses, requestQueueSize, reconnectLock)
       _               <- executor.run.forkScoped
-      _               <- executor.auth
+      _               <- executor.initializeConnection
       _               <- logScopeFinalizer(s"$executor Node Executor is closed")
     } yield executor
 

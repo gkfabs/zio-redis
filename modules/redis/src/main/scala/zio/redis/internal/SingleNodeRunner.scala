@@ -32,8 +32,11 @@ private[redis] trait SingleNodeRunner {
    */
   private[internal] final val run: IO[RedisError, AnyVal] =
     ZIO.logTrace(s"$this sender and reader has been started") *>
-      (send.either.repeat(Schedule.forever) race receive
-        .tapError(e => ZIO.logWarning(s"Reconnecting due to error: $e") *> onError(e))
+      (send
+        .tapError(e => ZIO.logWarning(s"Reconnecting due to write error: $e") *> onError(e))
+        .either
+        .repeat(Schedule.forever) race receive
+        .tapError(e => ZIO.logWarning(s"Reconnecting due to read error: $e") *> onError(e))
         .retry(Schedule.exponential(10.millis)))
         .tapError(e => ZIO.logError(s"Executor exiting: $e"))
 }
